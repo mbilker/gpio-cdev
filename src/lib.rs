@@ -81,11 +81,11 @@
 
 #[macro_use]
 extern crate bitflags;
-#[macro_use]
-extern crate error_chain;
 extern crate libc;
 #[macro_use]
 extern crate nix;
+#[macro_use]
+extern crate snafu;
 
 use std::cmp::min;
 use std::ffi::CStr;
@@ -97,6 +97,8 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 use std::ops::Index;
+
+use snafu::ResultExt;
 
 pub mod errors;
 mod ffi;
@@ -182,25 +184,26 @@ impl Iterator for ChipIterator {
 /// Iterate over all GPIO chips currently present on this system
 pub fn chips() -> Result<ChipIterator> {
     Ok(ChipIterator {
-        readdir: read_dir("/dev").chain_err(|| "unabled to read /dev directory")?,
+        readdir: read_dir("/dev").context(ReadDevDirectory)?,
     })
 }
 
 impl Chip {
     /// Open the GPIO Chip at the provided path (e.g. `/dev/gpiochip<N>`)
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Chip> {
-        let f = File::open(path.as_ref())
-            .chain_err(|| format!("Opening chip at path {:?} failed", path.as_ref()))?;
+        let path = path.as_ref();
+        let f = File::open(path)
+            .context(OpenChip { path })?;
         let mut info: ffi::gpiochip_info = unsafe { mem::uninitialized() };
         let _ = unsafe {
             ffi::gpio_get_chipinfo_ioctl(f.as_raw_fd(), &mut info)
-                .chain_err(|| format!("Getting chip info failed for {:?}", path.as_ref()))?
+                .context(GetChipInfo { path })?
         };
 
         Ok(Chip {
             inner: Arc::new(Box::new(InnerChip {
                 file: f,
-                path: path.as_ref().to_path_buf(),
+                path: path.to_path_buf(),
                 name: unsafe {
                     CStr::from_ptr(info.name.as_ptr())
                         .to_string_lossy()
@@ -390,7 +393,7 @@ unsafe fn cstrbuf_to_string(buf: &[libc::c_char]) -> Option<String> {
 impl Line {
     fn new(chip: Arc<Box<InnerChip>>, offset: u32) -> Result<Line> {
         if offset >= chip.lines {
-            bail!("Offset out of range")
+            return Err(Error::OffsetOutOfRange);
         }
         Ok(Line { chip, offset, })
     }
@@ -405,7 +408,7 @@ impl Line {
         };
         let _ = unsafe {
             ffi::gpio_get_lineinfo_ioctl(self.chip.file.as_raw_fd(), &mut line_info)
-                .chain_err(|| "lineinfo ioctl failed")?
+                .context(LineinfoIoctl)?
         };
 
         Ok(LineInfo {
@@ -480,7 +483,7 @@ impl Line {
         };
         unsafe {
             ffi::gpio_get_linehandle_ioctl(self.chip.file.as_raw_fd(), &mut request)
-                .chain_err(|| "linehandle request ioctl failed")?
+                .context(LinehandleRequestIoctl)?
         };
         Ok(LineHandle {
             line: self.clone(),
@@ -549,7 +552,7 @@ impl Line {
         };
         unsafe {
             ffi::gpio_get_lineevent_ioctl(self.chip.file.as_raw_fd(), &mut request)
-                .chain_err(|| "lineevent ioctl failed")?
+                .context(LineeventIoctl)?
         };
 
         Ok(LineEventHandle {
@@ -653,7 +656,7 @@ impl LineHandle {
         let mut data: ffi::gpiohandle_data = unsafe { mem::zeroed() };
         let _ = unsafe {
             ffi::gpiohandle_get_line_values_ioctl(self.file.as_raw_fd(), &mut data)
-                .chain_err(|| "getting line value failed")?
+                .context(GetLineValue)?
         };
         Ok(data.values[0])
     }
@@ -671,7 +674,7 @@ impl LineHandle {
         data.values[0] = value;
         let _ = unsafe {
             ffi::gpiohandle_set_line_values_ioctl(self.file.as_raw_fd(), &mut data)
-                .chain_err(|| "setting line value failed")?
+                .context(SetLineValue)?
         };
         Ok(())
     }
@@ -775,7 +778,7 @@ impl Lines {
         };
         unsafe {
             ffi::gpio_get_linehandle_ioctl(self.lines[0].chip().inner.file.as_raw_fd(), &mut request)
-                .chain_err(|| "linehandle request ioctl failed")?
+                .context(LinehandleRequestIoctl)?
         };
         let lines = self.lines.clone();
         Ok(MultiLineHandle {
@@ -826,7 +829,7 @@ impl MultiLineHandle {
         let mut data: ffi::gpiohandle_data = unsafe { mem::zeroed() };
         let _ = unsafe {
             ffi::gpiohandle_get_line_values_ioctl(self.file.as_raw_fd(), &mut data)
-                .chain_err(|| "getting line value failed")?
+                .context(GetLineValue)?
         };
         let n = self.num_lines();
         let values: Vec<u8> = (0..n).map(|i| data.values[i]).collect();
@@ -852,7 +855,7 @@ impl MultiLineHandle {
         }
         let _ = unsafe {
             ffi::gpiohandle_set_line_values_ioctl(self.file.as_raw_fd(), &mut data)
-                .chain_err(|| "setting line value failed")?
+                .context(SetLineValue)?
         };
         Ok(())
     }
